@@ -35,3 +35,4 @@ Deployed via [Streamlit Community Cloud](https://share.streamlit.io).
 - **Charts:** Plotly
 - **Data:** Odoo 19 Enterprise (XML-RPC API)
 - **Language:** Python 3.14
+
