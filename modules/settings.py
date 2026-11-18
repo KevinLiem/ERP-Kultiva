@@ -1,213 +1,110 @@
 import streamlit as st
 import pandas as pd
-from modules.odoo_client import (
-    odoo_read, odoo_create, odoo_write, to_df, get_uoms, flatten_m2o
+from modules.db import (
+    db_query, db_execute, get_uoms
 )
 
 def render_settings():
     st.title("⚙️ Units of Measure & Conversions")
     st.markdown("""
     <div style="background:#e8f5e9;border-left:4px solid #4caf50;padding:12px;border-radius:6px;margin-bottom:12px">
-    Master settings for Units of Measure (UoM). These sync directly with Odoo. Changes here affect product pricing,
-    stock moves, and purchase/sale order lines.
+    <b>Master Settings — Kultiva ERP Database</b><br>
+    Configure and customize measurement units, factor ratios, and active conversions directly in your independent database.
     </div>""", unsafe_allow_html=True)
 
-    tab_view,tab_edit,tab_conv,tab_cat = st.tabs([
-        "📋 View All UoMs","✏️ Edit / Create UoM","🔄 Conversion Calculator","🗂️ UoM Categories"
+    tab_view, tab_edit, tab_conv = st.tabs([
+        "📋 View All UoMs", "✏️ Edit / Register UoM", "🔄 Conversion Calculator"
     ])
 
     # ── VIEW ──────────────────────────────────────────────────────────────
     with tab_view:
-        with st.spinner():
-            uoms = get_uoms()
+        uoms = db_query("SELECT * FROM uoms ORDER BY id ASC")
         if uoms:
-            df = to_df(uoms)
-            c1,c2 = st.columns(2)
-            c1.metric("Total UoMs", len(df))
-            c2.metric("Categories", df["category_id"].nunique())
+            df = pd.DataFrame(uoms)
+            c1, c2 = st.columns(2)
+            c1.metric("Total UoMs Configured", len(df))
+            c2.metric("Active Units", len(df[df["active"] == 1]))
 
-            cats = ["All"] + sorted(df["category_id"].dropna().unique().tolist())
-            cat_sel = st.selectbox("Filter by Category", cats)
-            df_f = df if cat_sel == "All" else df[df["category_id"]==cat_sel]
-
-            disp = df_f[["name","category_id","uom_type","factor","factor_inv","active"]].copy()
-            disp.columns = ["Unit Name","Category","Type","Factor","Factor Inv","Active"]
-            disp["Type"] = disp["Type"].map({
-                "reference":"⭐ Reference","bigger":"📈 Bigger","smaller":"📉 Smaller"
-            }).fillna(disp["Type"])
-            disp["Active"] = disp["Active"].apply(lambda x: "✅" if x else "❌")
-            st.dataframe(disp,use_container_width=True,hide_index=True)
-
-            by_cat = df.groupby("category_id")["name"].apply(list).reset_index()
-            by_cat.columns = ["Category","Units"]
-            by_cat["Units"] = by_cat["Units"].apply(lambda x: " | ".join(x))
-            st.markdown('<div class="section-header">📂 Units by Category</div>', unsafe_allow_html=True)
-            st.dataframe(by_cat,use_container_width=True,hide_index=True)
+            disp = df[["name", "category", "uom_type", "factor", "rounding", "active"]].copy()
+            disp.columns = ["Unit Name", "Category", "Type", "Conversion Factor", "Precision", "Active"]
+            disp["Active"] = disp["Active"].apply(lambda x: "✅ Active" if x == 1 else "❌ Inactive")
+            st.dataframe(disp, use_container_width=True, hide_index=True)
 
     # ── EDIT / CREATE ─────────────────────────────────────────────────────
     with tab_edit:
-        with st.spinner():
-            uoms = get_uoms()
-            uom_cats = odoo_read("uom.category",[],["id","name"],limit=50)
-
         st.markdown('<div class="section-header">✏️ Edit Existing UoM</div>', unsafe_allow_html=True)
+        uoms = db_query("SELECT * FROM uoms ORDER BY name ASC")
         if uoms:
             uom_opts = {u["name"]: u for u in uoms}
-            sel_uom_name = st.selectbox("Select UoM to Edit", ["-- Select --"] + list(uom_opts.keys()))
+            sel_uom_name = st.selectbox("Select Unit to Modify", ["-- Select --"] + list(uom_opts.keys()))
             if sel_uom_name != "-- Select --":
                 sel_uom = uom_opts[sel_uom_name]
-                cat_map = {c["name"]: c["id"] for c in uom_cats}
-                cat_names = sorted(cat_map.keys())
-
-                c1,c2,c3 = st.columns(3)
+                c1, c2, c3 = st.columns(3)
                 new_name = c1.text_input("Unit Name", value=sel_uom["name"], key="edit_uom_name")
-                curr_cat = flatten_m2o(sel_uom["category_id"])
-                new_cat  = c2.selectbox("Category", cat_names,
-                    index=cat_names.index(curr_cat) if curr_cat in cat_names else 0,
-                    key="edit_uom_cat")
-                uom_types = ["reference","bigger","smaller"]
-                new_type = c3.selectbox("Type", uom_types,
-                    index=uom_types.index(sel_uom["uom_type"]) if sel_uom["uom_type"] in uom_types else 0,
-                    key="edit_uom_type")
+                new_cat  = c2.text_input("Category", value=sel_uom["category"] or "General", key="edit_uom_cat")
+                new_type = c3.selectbox("Type", ["reference", "bigger", "smaller", "relative"],
+                    index=["reference", "bigger", "smaller", "relative"].index(sel_uom["uom_type"]) if sel_uom["uom_type"] in ["reference", "bigger", "smaller", "relative"] else 0)
 
-                col_f1,col_f2,col_f3 = st.columns(3)
-                new_factor = col_f1.number_input("Factor (ratio to reference)",
-                    value=float(sel_uom["factor"]), min_value=0.00001, step=0.001, key="edit_uom_factor",
-                    help="For 'bigger': how many base units = 1 of this. For 'smaller': 1/factor.")
-                new_active = col_f3.checkbox("Active", value=bool(sel_uom["active"]), key="edit_uom_active")
-                st.caption(f"Factor inverse: **{1/new_factor:.6f}** (auto-calculated by Odoo)")
+                col_f1, col_f2, col_f3 = st.columns(3)
+                new_factor = col_f1.number_input("Factor vs Base Reference", value=float(sel_uom["factor"]), min_value=0.000001, step=0.001)
+                new_round = col_f2.number_input("Rounding Precision", value=float(sel_uom["rounding"]), min_value=0.000001, step=0.01)
+                new_active = col_f3.checkbox("Is Active", value=bool(sel_uom["active"]))
 
-                if st.button("💾 Save UoM Changes", type="primary"):
-                    vals = {
-                        "name": new_name,
-                        "category_id": cat_map[new_cat],
-                        "uom_type": new_type,
-                        "factor": new_factor,
-                        "active": new_active,
-                    }
-                    res = odoo_write("uom.uom", sel_uom["id"], vals)
-                    if res:
-                        st.success(f"✅ UoM '{new_name}' updated!")
-                        st.cache_data.clear()
-                    else:
-                        st.error("Failed to update. Check permissions.")
+                if st.button("💾 Save Changes to UoM", type="primary"):
+                    db_execute("""
+                        UPDATE uoms SET name = ?, category = ?, uom_type = ?, factor = ?, rounding = ?, active = ?
+                        WHERE id = ?
+                    """, (new_name, new_cat, new_type, new_factor, new_round, 1 if new_active else 0, sel_uom["id"]))
+                    st.success(f"✅ UoM '{new_name}' updated in Kultiva DB!")
+                    st.rerun()
 
-        st.markdown('<div class="section-header">➕ Create New UoM</div>', unsafe_allow_html=True)
-        with st.expander("Create New Unit of Measure"):
-            uom_cats_fresh = odoo_read("uom.category",[],["id","name"],limit=50)
-            cat_map_new = {c["name"]: c["id"] for c in uom_cats_fresh}
+        st.markdown('<div class="section-header">➕ Register New UoM</div>', unsafe_allow_html=True)
+        with st.expander("Register New Unit"):
+            nc1, nc2, nc3 = st.columns(3)
+            n_name = nc1.text_input("Unit Name (e.g. Karton, Pcs, Dus) *", key="n_uom_name")
+            n_cat  = nc2.text_input("Category (e.g. Weight, Unit, Volume)", value="Unit", key="n_uom_cat")
+            n_type = nc3.selectbox("Type", ["reference", "bigger", "smaller", "relative"], key="n_uom_type")
+            nf1, nf2 = st.columns(2)
+            n_factor = nf1.number_input("Factor vs Base Reference", value=1.0, min_value=0.000001, step=0.001, key="n_uom_factor")
+            n_round  = nf2.number_input("Rounding", value=0.01, min_value=0.000001, step=0.01, key="n_uom_round")
 
-            nc1,nc2,nc3 = st.columns(3)
-            n_name   = nc1.text_input("Unit Name *", key="new_uom_name")
-            n_cat    = nc2.selectbox("Category *", sorted(cat_map_new.keys()), key="new_uom_cat")
-            n_type   = nc3.selectbox("Type", ["reference","bigger","smaller"], key="new_uom_type")
-            nf1,nf2  = st.columns(2)
-            n_factor = nf1.number_input("Factor", value=1.0, min_value=0.00001, step=0.001, key="new_uom_factor",
-                help="Ratio vs. reference unit in this category")
-            n_rounding = nf2.number_input("Rounding Precision", value=0.01, min_value=0.00001, step=0.001, key="new_uom_rounding")
-
-            if st.button("✅ Create UoM", key="create_uom"):
+            if st.button("✅ Create New Unit in DB", key="btn_create_uom"):
                 if not n_name:
                     st.error("Unit name is required.")
                 else:
-                    new_id = odoo_create("uom.uom",{
-                        "name": n_name,
-                        "category_id": cat_map_new[n_cat],
-                        "uom_type": n_type,
-                        "factor": n_factor,
-                        "rounding": n_rounding,
-                        "active": True,
-                    })
-                    if new_id:
-                        st.success(f"✅ UoM '{n_name}' created! (ID: {new_id})")
-                        st.cache_data.clear()
+                    db_execute("""
+                        INSERT INTO uoms (name, category, uom_type, factor, rounding, active)
+                        VALUES (?, ?, ?, ?, ?, 1)
+                    """, (n_name, n_cat, n_type, n_factor, n_round))
+                    st.success(f"✅ Unit '{n_name}' successfully added to database!")
+                    st.rerun()
 
     # ── CONVERSION CALCULATOR ─────────────────────────────────────────────
     with tab_conv:
-        st.markdown('<div class="section-header">🔄 Unit Conversion Calculator</div>', unsafe_allow_html=True)
-        st.info("Convert quantities between units in the same category.")
+        st.markdown('<div class="section-header">🔄 Unit Conversion Engine</div>', unsafe_allow_html=True)
+        all_uoms = db_query("SELECT * FROM uoms WHERE active = 1 ORDER BY name ASC")
+        uom_map = {u["name"]: u for u in all_uoms}
+        u_names = sorted(uom_map.keys())
 
-        with st.spinner():
-            uoms = get_uoms()
-        uom_by_cat = {}
-        for u in uoms:
-            cat = flatten_m2o(u["category_id"])
-            if cat not in uom_by_cat:
-                uom_by_cat[cat] = []
-            uom_by_cat[cat].append(u)
+        if u_names:
+            c1, c2, c3 = st.columns(3)
+            from_u = c1.selectbox("From Unit", u_names, key="calc_from")
+            qty_val = c2.number_input("Quantity Input", value=100.0, step=1.0, key="calc_qty")
+            to_u = c3.selectbox("To Unit", u_names, index=1 if len(u_names) > 1 else 0, key="calc_to")
 
-        cats_avail = sorted(uom_by_cat.keys())
-        sel_cat = st.selectbox("Category", cats_avail, key="conv_cat")
+            if from_u and to_u:
+                f_obj = uom_map[from_u]
+                t_obj = uom_map[to_u]
 
-        if sel_cat and sel_cat in uom_by_cat:
-            units_in_cat = {u["name"]: u for u in uom_by_cat[sel_cat]}
-            unit_names = sorted(units_in_cat.keys())
-            ref_unit = next((u for u in uom_by_cat[sel_cat] if u["uom_type"]=="reference"), None)
-
-            c1,c2,c3 = st.columns(3)
-            from_unit = c1.selectbox("From Unit", unit_names, key="conv_from")
-            qty_in    = c2.number_input("Quantity", value=1.0, min_value=0.0, step=0.5, key="conv_qty")
-            to_unit   = c3.selectbox("To Unit", unit_names,
-                index=1 if len(unit_names)>1 else 0, key="conv_to")
-
-            if from_unit and to_unit and from_unit in units_in_cat and to_unit in units_in_cat:
-                fu = units_in_cat[from_unit]
-                tu = units_in_cat[to_unit]
-
-                def to_base(qty, uom):
-                    if uom["uom_type"] == "reference":
-                        return qty
-                    elif uom["uom_type"] == "bigger":
-                        return qty * uom["factor"]
-                    else:
-                        return qty / uom["factor"] if uom["factor"] else qty
-
-                def from_base(qty_base, uom):
-                    if uom["uom_type"] == "reference":
-                        return qty_base
-                    elif uom["uom_type"] == "bigger":
-                        return qty_base / uom["factor"] if uom["factor"] else qty_base
-                    else:
-                        return qty_base * uom["factor"]
-
-                base_qty = to_base(qty_in, fu)
-                result   = from_base(base_qty, tu)
+                # Convert using factor ratios
+                base_qty = qty_val * f_obj["factor"]
+                converted_qty = base_qty / t_obj["factor"] if t_obj["factor"] else 0.0
 
                 st.markdown(f"""
-                <div style="background:#e8f5e9;border-radius:12px;padding:20px;text-align:center;margin-top:12px">
+                <div style="background:#e8f5e9;border-radius:12px;padding:22px;text-align:center;margin-top:14px">
                     <h2 style="color:#2e7d32;margin:0">
-                        {qty_in:,.4f} {from_unit} = <span style="font-size:1.5em">{result:,.4f} {to_unit}</span>
+                        {qty_val:,.2f} {from_u} = <span style="font-size:1.45em;font-weight:bold;color:#1b5e20">{converted_qty:,.4f} {to_u}</span>
                     </h2>
-                    <p style="color:#666;margin:8px 0 0">via {ref_unit['name'] if ref_unit else 'base'} = {base_qty:,.4f}</p>
+                    <p style="color:#666;margin:8px 0 0">Normalized via base factor: {base_qty:,.4f}</p>
                 </div>
                 """, unsafe_allow_html=True)
-
-                st.markdown('<div class="section-header">📊 Full Conversion Table</div>', unsafe_allow_html=True)
-                rows = []
-                for un, uom in units_in_cat.items():
-                    base = to_base(1.0, uom)
-                    rows.append({"Unit": un, "Type": uom["uom_type"], "1 unit = (base)": round(base,6)})
-                df_ct = pd.DataFrame(rows)
-                st.dataframe(df_ct,use_container_width=True,hide_index=True)
-
-    # ── UoM CATEGORIES ────────────────────────────────────────────────────
-    with tab_cat:
-        st.markdown('<div class="section-header">🗂️ UoM Categories</div>', unsafe_allow_html=True)
-        with st.spinner():
-            cats = odoo_read("uom.category",[],["id","name"],limit=50)
-        if cats:
-            df_cats = pd.DataFrame(cats)
-            df_cats.columns = ["ID","Category Name"]
-            st.dataframe(df_cats,use_container_width=True,hide_index=True)
-
-        st.markdown("**Create New Category:**")
-        with st.expander("New Category"):
-            nc_name = st.text_input("Category Name *", key="new_cat_name")
-            if st.button("✅ Create Category"):
-                if not nc_name:
-                    st.error("Name required.")
-                else:
-                    cid = odoo_create("uom.category",{"name": nc_name})
-                    if cid:
-                        st.success(f"✅ Category '{nc_name}' created!")
-                        st.cache_data.clear()

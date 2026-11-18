@@ -1,9 +1,8 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-from modules.odoo_client import (
-    odoo_read, odoo_create, odoo_write, odoo_action,
-    to_df, fmt_idr, status_badge, flatten_m2o,
+from modules.db import (
+    db_query, db_query_df, db_execute, fmt_idr, status_badge,
     get_partners, get_products, get_uoms
 )
 
@@ -19,73 +18,96 @@ def render_sales():
             st_filter = st.multiselect("Status", ["draft","sent","sale","done","cancel"],
                 default=["draft","sent","sale"])
         with col_f2:
-            d_from = st.date_input("From", datetime.now()-timedelta(days=90))
+            d_from = st.date_input("From", datetime.now()-timedelta(days=180))
         with col_f3:
             d_to = st.date_input("To", datetime.now())
 
-        with st.spinner():
-            so = odoo_read("sale.order",
-                [["state","in",st_filter],
-                 ["date_order",">=",d_from.strftime("%Y-%m-%d 00:00:00")],
-                 ["date_order","<=",d_to.strftime("%Y-%m-%d 23:59:59")]],
-                ["name","partner_id","state","amount_total","amount_untaxed",
-                 "date_order","user_id","invoice_status","commitment_date"],
-                limit=500, order="date_order desc")
+        st_filter_str = "('" + "', '".join(st_filter) + "')" if st_filter else "('')"
+        d_from_str = d_from.strftime("%Y-%m-%d 00:00:00")
+        d_to_str = d_to.strftime("%Y-%m-%d 23:59:59")
 
-        if so:
-            df = to_df(so)
+        df = db_query_df(f"""
+            SELECT id, name, partner_name, state, amount_untaxed, amount_total, date_order 
+            FROM sale_orders
+            WHERE state IN {st_filter_str}
+              AND date_order >= ? AND date_order <= ?
+            ORDER BY id DESC
+        """, (d_from_str, d_to_str))
+
+        if not df.empty:
             c1,c2,c3,c4 = st.columns(4)
             c1.metric("Orders", len(df))
             c2.metric("Total Revenue", fmt_idr(df["amount_total"].sum()))
             c3.metric("Confirmed", len(df[df["state"]=="sale"]))
             c4.metric("Avg Value", fmt_idr(df["amount_total"].mean()))
 
-            srch = st.text_input("🔍 Search")
+            srch = st.text_input("🔍 Search Order / Customer")
             if srch:
-                df = df[df["partner_id"].str.contains(srch,case=False,na=False)|
+                df = df[df["partner_name"].str.contains(srch,case=False,na=False)|
                         df["name"].str.contains(srch,case=False,na=False)]
 
-            disp = df[["name","partner_id","state","amount_untaxed","amount_total","date_order"]].copy()
+            disp = df[["name","partner_name","state","amount_untaxed","amount_total","date_order"]].copy()
             disp.columns = ["Order","Customer","Status","Subtotal","Total","Date"]
             disp["Total"] = disp["Total"].apply(fmt_idr)
             disp["Subtotal"] = disp["Subtotal"].apply(fmt_idr)
-            disp["Date"] = pd.to_datetime(disp["Date"]).dt.strftime("%d %b %Y")
+            disp["Date"] = pd.to_datetime(disp["Date"], errors="coerce").dt.strftime("%d %b %Y")
             disp["Status"] = disp["Status"].apply(status_badge)
             st.dataframe(disp, use_container_width=True, hide_index=True)
 
             # Quick actions
             st.markdown('<div class="section-header">⚡ Quick Actions</div>', unsafe_allow_html=True)
-            so_names = {r["name"]: r["id"] for r in so}
-            sel_so = st.selectbox("Select Order", list(so_names.keys()))
-            if sel_so:
-                sel_id = so_names[sel_so]
-                sel_state = next(r["state"] for r in so if r["id"]==sel_id)
+            so_records = db_query("SELECT id, name, state FROM sale_orders ORDER BY id DESC LIMIT 100")
+            so_map = {f"{r['name']} ({r['state']})": r for r in so_records}
+            sel_so_label = st.selectbox("Select Order", list(so_map.keys()))
+            if sel_so_label:
+                sel_rec = so_map[sel_so_label]
+                sel_id = sel_rec["id"]
+                sel_state = sel_rec["state"]
                 ca, cb, cc = st.columns(3)
-                if sel_state == "draft":
+                if sel_state in ["draft", "sent"]:
                     if ca.button("✅ Confirm Order"):
-                        res = odoo_action("sale.order","action_confirm",sel_id)
-                        if res is not None:
-                            st.success(f"Order {sel_so} confirmed!")
-                            st.cache_data.clear(); st.rerun()
+                        db_execute("UPDATE sale_orders SET state = 'sale' WHERE id = ?", (sel_id,))
+                        # Automatically create an outgoing delivery picking in database
+                        so_data = db_query("SELECT * FROM sale_orders WHERE id = ?", (sel_id,))[0]
+                        pick_name = f"WH/OUT/{so_data['name']}"
+                        pick_id = db_execute("""
+                            INSERT INTO stock_pickings (name, partner_id, partner_name, picking_type_code, picking_type_name, state, scheduled_date, origin, sale_id)
+                            VALUES (?, ?, ?, 'outgoing', 'Delivery Orders', 'assigned', ?, ?, ?)
+                        """, (pick_name, so_data["partner_id"], so_data["partner_name"], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), so_data["name"], sel_id))
+                        # Create stock moves from lines
+                        lines = db_query("SELECT * FROM sale_order_lines WHERE order_id = ?", (sel_id,))
+                        for ln in lines:
+                            db_execute("""
+                                INSERT INTO stock_moves (picking_id, product_id, product_name, product_uom_qty, quantity, product_uom, state, date)
+                                VALUES (?, ?, ?, ?, ?, ?, 'assigned', ?)
+                            """, (pick_id, ln["product_id"], ln["product_name"], ln["product_uom_qty"], ln["product_uom_qty"], ln["product_uom"], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                        st.success(f"Order {so_data['name']} confirmed and Delivery Note generated!")
+                        st.rerun()
+
                 if sel_state == "sale":
                     if cb.button("🚚 View Deliveries"):
-                        picks = odoo_read("stock.picking",
-                            [["sale_id","=",sel_id]],["id","name","state"])
-                        st.info(f"Deliveries: {[p['name'] for p in picks]}")
-                if cc.button("🗑️ Cancel Order") and sel_state in ["draft","sent"]:
-                    odoo_action("sale.order","action_cancel",sel_id)
-                    st.warning(f"Order {sel_so} cancelled."); st.cache_data.clear(); st.rerun()
+                        picks = db_query("SELECT name, state FROM stock_pickings WHERE sale_id = ?", (sel_id,))
+                        if picks:
+                            st.info(f"Associated Deliveries: {', '.join([p['name'] + ' (' + p['state'] + ')' for p in picks])}")
+                        else:
+                            st.info("No delivery order found for this sales order.")
+
+                if sel_state in ["draft", "sent"]:
+                    if cc.button("🗑️ Cancel Order"):
+                        db_execute("UPDATE sale_orders SET state = 'cancel' WHERE id = ?", (sel_id,))
+                        st.warning("Order cancelled.")
+                        st.rerun()
+        else:
+            st.info("No orders found for the selected filter range.")
 
     # ── CREATE ────────────────────────────────────────────────────────────
     elif sub == "➕ Create New":
         st.title("➕ Create Sales Order")
 
-        with st.spinner("Loading master data..."):
-            cust_map, cust_recs = get_partners(customer=True)
-            prod_map, prod_recs  = get_products()
-            uoms = get_uoms()
+        cust_map, cust_recs = get_partners(customer=True)
+        prod_map, prod_recs = get_products()
+        uoms = get_uoms()
 
-        # Header
         st.markdown('<div class="section-header">📋 Order Header</div>', unsafe_allow_html=True)
         c1,c2,c3 = st.columns(3)
         cust_names = ["-- Select Customer --"] + sorted(cust_map.keys())
@@ -94,7 +116,6 @@ def render_sales():
         commitment = c3.date_input("Delivery Date (Optional)", datetime.now()+timedelta(days=7))
         note = st.text_area("Notes / Terms", height=60)
 
-        # Lines
         st.markdown('<div class="section-header">📦 Order Lines</div>', unsafe_allow_html=True)
         prod_names = ["-- Select Product --"] + sorted(prod_map.keys())
 
@@ -115,18 +136,15 @@ def render_sales():
                 if np_sel == "-- Select Product --":
                     st.warning("Select a product first.")
                 else:
-                    uom_id = next((u["id"] for u in uoms if u["name"]==np_uom), None)
                     st.session_state.so_lines.append({
                         "product_name": np_sel,
                         "product_id":   prod_map[np_sel]["id"],
                         "qty":          np_qty,
                         "uom":          np_uom,
-                        "uom_id":       uom_id,
                         "price":        np_price,
                         "subtotal":     np_qty * np_price,
                     })
 
-        # Show lines table
         if st.session_state.so_lines:
             df_lines = pd.DataFrame(st.session_state.so_lines)
             df_lines["subtotal"] = df_lines["subtotal"].apply(fmt_idr)
@@ -139,7 +157,6 @@ def render_sales():
                 st.session_state.so_lines = []
                 st.rerun()
 
-        # Submit
         st.markdown("---")
         col_s1, col_s2 = st.columns(2)
         if col_s1.button("💾 Save as Draft", type="primary"):
@@ -148,25 +165,21 @@ def render_sales():
             elif not st.session_state.so_lines:
                 st.error("Add at least one order line.")
             else:
-                with st.spinner("Creating order..."):
-                    so_id = odoo_create("sale.order", {
-                        "partner_id": cust_map[sel_cust],
-                        "date_order": ord_date.strftime("%Y-%m-%d %H:%M:%S"),
-                        "commitment_date": commitment.strftime("%Y-%m-%d %H:%M:%S"),
-                        "note": note,
-                    })
-                    if so_id:
-                        for ln in st.session_state.so_lines:
-                            odoo_create("sale.order.line", {
-                                "order_id":        so_id,
-                                "product_id":      ln["product_id"],
-                                "product_uom_qty": ln["qty"],
-                                "product_uom":     ln["uom_id"],
-                                "price_unit":      ln["price"],
-                            })
-                        st.session_state.so_lines = []
-                        st.cache_data.clear()
-                        st.success(f"✅ Sales Order created! ID: {so_id}")
+                total_val = sum(l["qty"] * l["price"] for l in st.session_state.so_lines)
+                last_order = db_query("SELECT id FROM sale_orders ORDER BY id DESC LIMIT 1")
+                next_num = (last_order[0]["id"] + 1) if last_order else 1
+                so_name = f"SO{next_num:05d}"
+                so_id = db_execute("""
+                    INSERT INTO sale_orders (name, partner_id, partner_name, date_order, commitment_date, state, amount_untaxed, amount_total, note)
+                    VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?)
+                """, (so_name, cust_map[sel_cust], sel_cust, ord_date.strftime("%Y-%m-%d %H:%M:%S"), commitment.strftime("%Y-%m-%d %H:%M:%S"), total_val, total_val, note))
+                for ln in st.session_state.so_lines:
+                    db_execute("""
+                        INSERT INTO sale_order_lines (order_id, product_id, product_name, product_uom_qty, product_uom, price_unit, price_subtotal)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (so_id, ln["product_id"], ln["product_name"], ln["qty"], ln["uom"], ln["price"], ln["subtotal"]))
+                st.session_state.so_lines = []
+                st.success(f"✅ Sales Order {so_name} saved into Kultiva Database!")
 
         if col_s2.button("✅ Save & Confirm"):
             if sel_cust == "-- Select Customer --":
@@ -174,71 +187,71 @@ def render_sales():
             elif not st.session_state.so_lines:
                 st.error("Add at least one order line.")
             else:
-                with st.spinner("Creating & confirming..."):
-                    so_id = odoo_create("sale.order", {
-                        "partner_id": cust_map[sel_cust],
-                        "date_order": ord_date.strftime("%Y-%m-%d %H:%M:%S"),
-                        "commitment_date": commitment.strftime("%Y-%m-%d %H:%M:%S"),
-                        "note": note,
-                    })
-                    if so_id:
-                        for ln in st.session_state.so_lines:
-                            odoo_create("sale.order.line", {
-                                "order_id":        so_id,
-                                "product_id":      ln["product_id"],
-                                "product_uom_qty": ln["qty"],
-                                "product_uom":     ln["uom_id"],
-                                "price_unit":      ln["price"],
-                            })
-                        odoo_action("sale.order","action_confirm",so_id)
-                        st.session_state.so_lines = []
-                        st.cache_data.clear()
-                        st.success(f"✅ Sales Order #{so_id} confirmed!")
+                total_val = sum(l["qty"] * l["price"] for l in st.session_state.so_lines)
+                last_order = db_query("SELECT id FROM sale_orders ORDER BY id DESC LIMIT 1")
+                next_num = (last_order[0]["id"] + 1) if last_order else 1
+                so_name = f"SO{next_num:05d}"
+                so_id = db_execute("""
+                    INSERT INTO sale_orders (name, partner_id, partner_name, date_order, commitment_date, state, amount_untaxed, amount_total, note)
+                    VALUES (?, ?, ?, ?, ?, 'sale', ?, ?, ?)
+                """, (so_name, cust_map[sel_cust], sel_cust, ord_date.strftime("%Y-%m-%d %H:%M:%S"), commitment.strftime("%Y-%m-%d %H:%M:%S"), total_val, total_val, note))
+                for ln in st.session_state.so_lines:
+                    db_execute("""
+                        INSERT INTO sale_order_lines (order_id, product_id, product_name, product_uom_qty, product_uom, price_unit, price_subtotal)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (so_id, ln["product_id"], ln["product_name"], ln["qty"], ln["uom"], ln["price"], ln["subtotal"]))
+                # Create Delivery Picking
+                pick_name = f"WH/OUT/{so_name}"
+                pick_id = db_execute("""
+                    INSERT INTO stock_pickings (name, partner_id, partner_name, picking_type_code, picking_type_name, state, scheduled_date, origin, sale_id)
+                    VALUES (?, ?, ?, 'outgoing', 'Delivery Orders', 'assigned', ?, ?, ?)
+                """, (pick_name, cust_map[sel_cust], sel_cust, commitment.strftime("%Y-%m-%d %H:%M:%S"), so_name, so_id))
+                for ln in st.session_state.so_lines:
+                    db_execute("""
+                        INSERT INTO stock_moves (picking_id, product_id, product_name, product_uom_qty, quantity, product_uom, state, date)
+                        VALUES (?, ?, ?, ?, ?, ?, 'assigned', ?)
+                    """, (pick_id, ln["product_id"], ln["product_name"], ln["qty"], ln["qty"], ln["uom"], ord_date.strftime("%Y-%m-%d %H:%M:%S")))
+                st.session_state.so_lines = []
+                st.success(f"✅ Sales Order {so_name} confirmed & Delivery Note {pick_name} generated!")
 
     # ── EDIT ──────────────────────────────────────────────────────────────
     elif sub == "✏️ Edit Existing":
         st.title("✏️ Edit Sales Order")
 
-        with st.spinner():
-            so_list = odoo_read("sale.order",[["state","in",["draft","sent"]]],
-                ["id","name","partner_id","state","amount_total","note",
-                 "date_order","commitment_date"], limit=200, order="date_order desc")
-
+        so_list = db_query("SELECT * FROM sale_orders WHERE state IN ('draft', 'sent') ORDER BY id DESC")
         if not so_list:
             st.info("No editable orders (draft/sent) found.")
         else:
-            so_opts = {f"{r['name']} — {flatten_m2o(r['partner_id'])}": r["id"] for r in so_list}
+            so_opts = {f"{r['name']} — {r['partner_name']}": r for r in so_list}
             sel = st.selectbox("Select Order to Edit", list(so_opts.keys()))
             if sel:
-                eid = so_opts[sel]
-                rec = next(r for r in so_list if r["id"]==eid)
-
-                lines = odoo_read("sale.order.line",[["order_id","=",eid]],
-                    ["id","product_id","product_uom_qty","price_unit","product_uom","price_subtotal"])
+                rec = so_opts[sel]
+                eid = rec["id"]
+                lines = db_query("SELECT * FROM sale_order_lines WHERE order_id = ?", (eid,))
 
                 st.markdown('<div class="section-header">📋 Order Details</div>', unsafe_allow_html=True)
                 cust_map, _ = get_partners(customer=True)
                 prod_map, _ = get_products()
-                uoms        = get_uoms()
+                uoms = get_uoms()
 
                 c1,c2 = st.columns(2)
-                curr_cust = flatten_m2o(rec["partner_id"])
                 cust_list = sorted(cust_map.keys())
+                curr_cust = rec["partner_name"]
                 new_cust = c1.selectbox("Customer", cust_list,
                     index=cust_list.index(curr_cust) if curr_cust in cust_list else 0)
-                new_note = c2.text_area("Notes", value=rec.get("note","") or "", height=60)
+                new_note = c2.text_area("Notes", value=rec.get("note") or "", height=60)
 
-                st.markdown('<div class="section-header">📦 Order Lines</div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-header">📦 Current Order Lines</div>', unsafe_allow_html=True)
                 if lines:
-                    df_l = to_df(lines)
+                    df_l = pd.DataFrame(lines)
                     df_l["subtotal_fmt"] = df_l["price_subtotal"].apply(fmt_idr)
-                    st.dataframe(df_l[["product_id","product_uom_qty","price_unit",
+                    st.dataframe(df_l[["product_name","product_uom_qty","price_unit",
                                        "product_uom","subtotal_fmt"]].rename(columns={
-                        "product_id":"Product","product_uom_qty":"Qty",
+                        "product_name":"Product","product_uom_qty":"Qty",
                         "price_unit":"Price","product_uom":"UoM","subtotal_fmt":"Subtotal"
                     }), use_container_width=True, hide_index=True)
 
-                st.markdown("**Add a new line:**")
+                st.markdown("**Add Line:**")
                 p_names = ["-- Select --"] + sorted(prod_map.keys())
                 ec1,ec2,ec3,ec4,ec5 = st.columns([3,1,1.5,1.5,1])
                 ep = ec1.selectbox("Product", p_names, key="edit_so_prod")
@@ -250,27 +263,43 @@ def render_sales():
                 ec5.markdown("<br>", unsafe_allow_html=True)
                 if ec5.button("➕", key="edit_so_add"):
                     if ep != "-- Select --":
-                        uom_id = next((u["id"] for u in uoms if u["name"]==eu), None)
-                        odoo_create("sale.order.line",{
-                            "order_id": eid,
-                            "product_id": prod_map[ep]["id"],
-                            "product_uom_qty": eq,
-                            "product_uom": uom_id,
-                            "price_unit": epr,
-                        })
-                        st.success("Line added!"); st.cache_data.clear(); st.rerun()
+                        sub_t = eq * epr
+                        db_execute("""
+                            INSERT INTO sale_order_lines (order_id, product_id, product_name, product_uom_qty, product_uom, price_unit, price_subtotal)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (eid, prod_map[ep]["id"], ep, eq, eu, epr, sub_t))
+                        # Update order total
+                        db_execute("""
+                            UPDATE sale_orders SET amount_total = (SELECT SUM(price_subtotal) FROM sale_order_lines WHERE order_id = ?),
+                                                   amount_untaxed = (SELECT SUM(price_subtotal) FROM sale_order_lines WHERE order_id = ?)
+                            WHERE id = ?
+                        """, (eid, eid, eid))
+                        st.success("Line added!")
+                        st.rerun()
 
                 st.markdown("---")
                 col_a, col_b, col_c = st.columns(3)
                 if col_a.button("💾 Save Changes", type="primary"):
-                    odoo_write("sale.order", eid, {
-                        "partner_id": cust_map[new_cust],
-                        "note": new_note,
-                    })
-                    st.success("✅ Order updated!"); st.cache_data.clear()
+                    db_execute("""
+                        UPDATE sale_orders SET partner_id = ?, partner_name = ?, note = ? WHERE id = ?
+                    """, (cust_map[new_cust], new_cust, new_note, eid))
+                    st.success("✅ Order updated!")
                 if col_b.button("✅ Confirm Order"):
-                    odoo_action("sale.order","action_confirm",eid)
-                    st.success("Order confirmed!"); st.cache_data.clear(); st.rerun()
+                    db_execute("UPDATE sale_orders SET state = 'sale' WHERE id = ?", (eid,))
+                    # Generate Delivery Order
+                    pick_name = f"WH/OUT/{rec['name']}"
+                    pick_id = db_execute("""
+                        INSERT INTO stock_pickings (name, partner_id, partner_name, picking_type_code, picking_type_name, state, scheduled_date, origin, sale_id)
+                        VALUES (?, ?, ?, 'outgoing', 'Delivery Orders', 'assigned', ?, ?, ?)
+                    """, (pick_name, cust_map[new_cust], new_cust, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), rec["name"], eid))
+                    for ln in lines:
+                        db_execute("""
+                            INSERT INTO stock_moves (picking_id, product_id, product_name, product_uom_qty, quantity, product_uom, state, date)
+                            VALUES (?, ?, ?, ?, ?, ?, 'assigned', ?)
+                        """, (pick_id, ln["product_id"], ln["product_name"], ln["product_uom_qty"], ln["product_uom_qty"], ln["product_uom"], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                    st.success("Order confirmed and Delivery Note generated!")
+                    st.rerun()
                 if col_c.button("🗑️ Cancel Order"):
-                    odoo_action("sale.order","action_cancel",eid)
-                    st.warning("Order cancelled."); st.cache_data.clear(); st.rerun()
+                    db_execute("UPDATE sale_orders SET state = 'cancel' WHERE id = ?", (eid,))
+                    st.warning("Order cancelled.")
+                    st.rerun()

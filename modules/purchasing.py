@@ -1,9 +1,8 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-from modules.odoo_client import (
-    odoo_read, odoo_create, odoo_write, odoo_action, odoo_call,
-    to_df, fmt_idr, status_badge, flatten_m2o,
+from modules.db import (
+    db_query, db_query_df, db_execute, fmt_idr, status_badge,
     get_partners, get_products, get_uoms, get_lots
 )
 
@@ -14,53 +13,68 @@ def render_purchasing():
     # ── LIST ──────────────────────────────────────────────────────────────
     if sub == "📋 List":
         st.title("🛒 Purchase Orders")
-        with st.spinner():
-            po = odoo_read("purchase.order",[],
-                ["name","partner_id","state","amount_total","date_order",
-                 "date_approve","user_id","invoice_status"],
-                limit=300, order="date_order desc")
-        if po:
-            df = to_df(po)
-            df["date_order"] = pd.to_datetime(df["date_order"],errors="coerce")
+        df = db_query_df("""
+            SELECT id, name, partner_name, state, amount_total, date_order 
+            FROM purchase_orders 
+            ORDER BY id DESC
+        """)
+        if not df.empty:
+            df["date_order"] = pd.to_datetime(df["date_order"], errors="coerce")
             c1,c2,c3,c4 = st.columns(4)
             c1.metric("Total POs", len(df))
             c2.metric("Confirmed", len(df[df["state"]=="purchase"]))
             c3.metric("Draft", len(df[df["state"]=="draft"]))
             c4.metric("Total Value", fmt_idr(df["amount_total"].sum()))
 
-            srch = st.text_input("🔍 Search")
+            srch = st.text_input("🔍 Search PO / Vendor")
             if srch:
-                df = df[df["partner_id"].str.contains(srch,case=False,na=False)|
+                df = df[df["partner_name"].str.contains(srch,case=False,na=False)|
                         df["name"].str.contains(srch,case=False,na=False)]
 
-            disp = df[["name","partner_id","state","amount_total","date_order"]].copy()
+            disp = df[["name","partner_name","state","amount_total","date_order"]].copy()
             disp.columns = ["PO","Vendor","Status","Total","Date"]
             disp["Total"] = disp["Total"].apply(fmt_idr)
             disp["Date"] = disp["Date"].dt.strftime("%d %b %Y")
             disp["Status"] = disp["Status"].apply(status_badge)
-            st.dataframe(disp,use_container_width=True,hide_index=True)
+            st.dataframe(disp, use_container_width=True, hide_index=True)
 
             # Quick confirm
-            po_opts = {f"{r['name']} — {flatten_m2o(r['partner_id'])}": r for r in po}
-            sel_po_name = st.selectbox("Select PO for action", list(po_opts.keys()))
+            po_records = db_query("SELECT id, name, partner_name, state FROM purchase_orders ORDER BY id DESC LIMIT 100")
+            po_opts = {f"{r['name']} — {r['partner_name']} ({r['state']})": r for r in po_records}
+            sel_po_name = st.selectbox("Select PO for Action", list(po_opts.keys()))
             if sel_po_name:
                 sel_po = po_opts[sel_po_name]
                 ca,cb,cc = st.columns(3)
                 if sel_po["state"] == "draft":
                     if ca.button("✅ Confirm PO"):
-                        odoo_action("purchase.order","button_confirm",sel_po["id"])
-                        st.success("PO confirmed!"); st.cache_data.clear(); st.rerun()
-                if sel_po["state"] in ["draft"]:
-                    if cc.button("🗑️ Cancel"):
-                        odoo_action("purchase.order","button_cancel",sel_po["id"])
-                        st.warning("PO cancelled."); st.cache_data.clear(); st.rerun()
+                        db_execute("UPDATE purchase_orders SET state = 'purchase' WHERE id = ?", (sel_po["id"],))
+                        # Create incoming receipt picking
+                        rcpt_name = f"WH/IN/{sel_po['name']}"
+                        pick_id = db_execute("""
+                            INSERT INTO stock_pickings (name, partner_id, partner_name, picking_type_code, picking_type_name, state, scheduled_date, origin, purchase_id)
+                            VALUES (?, 0, ?, 'incoming', 'Receipts', 'assigned', ?, ?, ?)
+                        """, (rcpt_name, sel_po["partner_name"], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), sel_po["name"], sel_po["id"]))
+                        lines = db_query("SELECT * FROM purchase_order_lines WHERE order_id = ?", (sel_po["id"],))
+                        for ln in lines:
+                            db_execute("""
+                                INSERT INTO stock_moves (picking_id, product_id, product_name, product_uom_qty, quantity, product_uom, state, date)
+                                VALUES (?, ?, ?, ?, ?, ?, 'assigned', ?)
+                            """, (pick_id, ln["product_id"], ln["product_name"], ln["product_qty"], ln["product_qty"], ln["product_uom"], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                        st.success(f"PO {sel_po['name']} confirmed and Incoming Receipt created!")
+                        st.rerun()
+
+                if sel_po["state"] == "draft":
+                    if cc.button("🗑️ Cancel PO"):
+                        db_execute("UPDATE purchase_orders SET state = 'cancel' WHERE id = ?", (sel_po["id"],))
+                        st.warning("PO cancelled.")
+                        st.rerun()
 
     # ── CREATE PO ─────────────────────────────────────────────────────────
     elif sub == "➕ Create PO":
         st.title("➕ Create Purchase Order")
 
         vend_map, vend_recs = get_partners(vendor=True)
-        prod_map, prod_recs  = get_products()
+        prod_map, prod_recs = get_products()
         uoms = get_uoms()
 
         st.markdown('<div class="section-header">📋 PO Header</div>', unsafe_allow_html=True)
@@ -85,13 +99,11 @@ def render_purchasing():
             if cp_prod == "-- Select Product --":
                 st.warning("Select a product.")
             else:
-                uom_id = next((u["id"] for u in uoms if u["name"]==cp_uom),None)
                 st.session_state.po_lines.append({
                     "product_name": cp_prod,
                     "product_id":   prod_map[cp_prod]["id"],
                     "qty":          cp_qty,
                     "uom":          cp_uom,
-                    "uom_id":       uom_id,
                     "price":        cp_price,
                     "subtotal":     cp_qty*cp_price,
                 })
@@ -115,27 +127,21 @@ def render_purchasing():
             elif not st.session_state.po_lines:
                 st.error("Add at least one line.")
             else:
-                with st.spinner("Creating PO..."):
-                    po_id = odoo_create("purchase.order",{
-                        "partner_id": vend_map[sel_vend],
-                        "date_order": po_date.strftime("%Y-%m-%d %H:%M:%S"),
-                        "date_planned": po_del.strftime("%Y-%m-%d %H:%M:%S"),
-                        "notes": po_note,
-                    })
-                    if po_id:
-                        for ln in st.session_state.po_lines:
-                            odoo_create("purchase.order.line",{
-                                "order_id":    po_id,
-                                "product_id":  ln["product_id"],
-                                "product_qty": ln["qty"],
-                                "product_uom": ln["uom_id"],
-                                "price_unit":  ln["price"],
-                                "date_planned": po_del.strftime("%Y-%m-%d %H:%M:%S"),
-                                "name":        ln["product_name"],
-                            })
-                        st.session_state.po_lines = []
-                        st.cache_data.clear()
-                        st.success(f"✅ PO created! ID: {po_id}")
+                total_val = sum(l["qty"] * l["price"] for l in st.session_state.po_lines)
+                last_po = db_query("SELECT id FROM purchase_orders ORDER BY id DESC LIMIT 1")
+                next_num = (last_po[0]["id"] + 1) if last_po else 1
+                po_name = f"PO{next_num:05d}"
+                po_id = db_execute("""
+                    INSERT INTO purchase_orders (name, partner_id, partner_name, date_order, date_planned, state, amount_total, notes)
+                    VALUES (?, ?, ?, ?, ?, 'draft', ?, ?)
+                """, (po_name, vend_map[sel_vend], sel_vend, po_date.strftime("%Y-%m-%d %H:%M:%S"), po_del.strftime("%Y-%m-%d %H:%M:%S"), total_val, po_note))
+                for ln in st.session_state.po_lines:
+                    db_execute("""
+                        INSERT INTO purchase_order_lines (order_id, product_id, product_name, product_qty, product_uom, price_unit, price_subtotal, name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (po_id, ln["product_id"], ln["product_name"], ln["qty"], ln["uom"], ln["price"], ln["subtotal"], ln["product_name"]))
+                st.session_state.po_lines = []
+                st.success(f"✅ Purchase Order {po_name} created in Kultiva DB!")
 
         if col_s2.button("✅ Save & Confirm"):
             if sel_vend == "-- Select Vendor --":
@@ -143,67 +149,65 @@ def render_purchasing():
             elif not st.session_state.po_lines:
                 st.error("Add at least one line.")
             else:
-                with st.spinner():
-                    po_id = odoo_create("purchase.order",{
-                        "partner_id": vend_map[sel_vend],
-                        "date_order": po_date.strftime("%Y-%m-%d %H:%M:%S"),
-                        "date_planned": po_del.strftime("%Y-%m-%d %H:%M:%S"),
-                        "notes": po_note,
-                    })
-                    if po_id:
-                        for ln in st.session_state.po_lines:
-                            odoo_create("purchase.order.line",{
-                                "order_id":    po_id,
-                                "product_id":  ln["product_id"],
-                                "product_qty": ln["qty"],
-                                "product_uom": ln["uom_id"],
-                                "price_unit":  ln["price"],
-                                "date_planned": po_del.strftime("%Y-%m-%d %H:%M:%S"),
-                                "name":        ln["product_name"],
-                            })
-                        odoo_action("purchase.order","button_confirm",po_id)
-                        st.session_state.po_lines = []
-                        st.cache_data.clear()
-                        st.success(f"✅ PO #{po_id} confirmed!")
+                total_val = sum(l["qty"] * l["price"] for l in st.session_state.po_lines)
+                last_po = db_query("SELECT id FROM purchase_orders ORDER BY id DESC LIMIT 1")
+                next_num = (last_po[0]["id"] + 1) if last_po else 1
+                po_name = f"PO{next_num:05d}"
+                po_id = db_execute("""
+                    INSERT INTO purchase_orders (name, partner_id, partner_name, date_order, date_planned, state, amount_total, notes)
+                    VALUES (?, ?, ?, ?, ?, 'purchase', ?, ?)
+                """, (po_name, vend_map[sel_vend], sel_vend, po_date.strftime("%Y-%m-%d %H:%M:%S"), po_del.strftime("%Y-%m-%d %H:%M:%S"), total_val, po_note))
+                for ln in st.session_state.po_lines:
+                    db_execute("""
+                        INSERT INTO purchase_order_lines (order_id, product_id, product_name, product_qty, product_uom, price_unit, price_subtotal, name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (po_id, ln["product_id"], ln["product_name"], ln["qty"], ln["uom"], ln["price"], ln["subtotal"], ln["product_name"]))
+                # Create receipt picking
+                rcpt_name = f"WH/IN/{po_name}"
+                pick_id = db_execute("""
+                    INSERT INTO stock_pickings (name, partner_id, partner_name, picking_type_code, picking_type_name, state, scheduled_date, origin, purchase_id)
+                    VALUES (?, ?, ?, 'incoming', 'Receipts', 'assigned', ?, ?, ?)
+                """, (rcpt_name, vend_map[sel_vend], sel_vend, po_del.strftime("%Y-%m-%d %H:%M:%S"), po_name, po_id))
+                for ln in st.session_state.po_lines:
+                    db_execute("""
+                        INSERT INTO stock_moves (picking_id, product_id, product_name, product_uom_qty, quantity, product_uom, state, date)
+                        VALUES (?, ?, ?, ?, ?, ?, 'assigned', ?)
+                    """, (pick_id, ln["product_id"], ln["product_name"], ln["qty"], ln["qty"], ln["uom"], po_date.strftime("%Y-%m-%d %H:%M:%S")))
+                st.session_state.po_lines = []
+                st.success(f"✅ PO {po_name} confirmed & Incoming Receipt generated!")
 
     # ── EDIT PO ───────────────────────────────────────────────────────────
     elif sub == "✏️ Edit PO":
         st.title("✏️ Edit Purchase Order")
-        with st.spinner():
-            po_list = odoo_read("purchase.order",[["state","in",["draft","sent"]]],
-                ["id","name","partner_id","state","amount_total","notes"],
-                limit=100, order="date_order desc")
-
+        po_list = db_query("SELECT * FROM purchase_orders WHERE state IN ('draft', 'sent') ORDER BY id DESC")
         if not po_list:
             st.info("No editable POs (draft/sent) found.")
         else:
             vend_map, _ = get_partners(vendor=True)
             prod_map, _ = get_products()
             uoms = get_uoms()
-            po_opts = {f"{r['name']} — {flatten_m2o(r['partner_id'])}": r["id"] for r in po_list}
+            po_opts = {f"{r['name']} — {r['partner_name']}": r for r in po_list}
             sel = st.selectbox("Select PO", list(po_opts.keys()))
             if sel:
-                eid = po_opts[sel]
-                rec = next(r for r in po_list if r["id"]==eid)
-                lines = odoo_read("purchase.order.line",[["order_id","=",eid]],
-                    ["id","product_id","product_qty","price_unit","product_uom","price_subtotal"])
+                rec = po_opts[sel]
+                eid = rec["id"]
+                lines = db_query("SELECT * FROM purchase_order_lines WHERE order_id = ?", (eid,))
 
-                curr_vend = flatten_m2o(rec["partner_id"])
+                curr_vend = rec["partner_name"]
                 vend_list = sorted(vend_map.keys())
                 new_vend = st.selectbox("Vendor", vend_list,
                     index=vend_list.index(curr_vend) if curr_vend in vend_list else 0)
-                new_note = st.text_area("Notes", value=rec.get("notes","") or "")
+                new_note = st.text_area("Notes", value=rec.get("notes") or "")
 
                 if lines:
-                    df_l = to_df(lines)
+                    df_l = pd.DataFrame(lines)
                     df_l["price_subtotal"] = df_l["price_subtotal"].apply(fmt_idr)
-                    st.dataframe(df_l[["product_id","product_qty","price_unit","product_uom","price_subtotal"]].rename(columns={
-                        "product_id":"Product","product_qty":"Qty","price_unit":"Unit Cost",
+                    st.dataframe(df_l[["product_name","product_qty","price_unit","product_uom","price_subtotal"]].rename(columns={
+                        "product_name":"Product","product_qty":"Qty","price_unit":"Unit Cost",
                         "product_uom":"UoM","price_subtotal":"Subtotal"
                     }),use_container_width=True,hide_index=True)
 
-                # Add line
-                st.markdown("**Add line:**")
+                st.markdown("**Add Line:**")
                 ep_names = ["-- Select --"] + sorted(prod_map.keys())
                 ec1,ec2,ec3,ec4,ec5 = st.columns([3,1,1.5,1.5,1])
                 ep = ec1.selectbox("Product",ep_names,key="epo_prod")
@@ -215,90 +219,82 @@ def render_purchasing():
                 ec5.markdown("<br>",unsafe_allow_html=True)
                 if ec5.button("➕",key="epo_add"):
                     if ep != "-- Select --":
-                        uom_id = next((u["id"] for u in uoms if u["name"]==eu),None)
-                        odoo_create("purchase.order.line",{
-                            "order_id": eid,
-                            "product_id": prod_map[ep]["id"],
-                            "product_qty": eq,
-                            "product_uom": uom_id,
-                            "price_unit": epr,
-                            "date_planned": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "name": ep,
-                        })
-                        st.success("Line added!"); st.cache_data.clear(); st.rerun()
+                        sub_t = eq * epr
+                        db_execute("""
+                            INSERT INTO purchase_order_lines (order_id, product_id, product_name, product_qty, product_uom, price_unit, price_subtotal, name)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (eid, prod_map[ep]["id"], ep, eq, eu, epr, sub_t, ep))
+                        db_execute("""
+                            UPDATE purchase_orders SET amount_total = (SELECT SUM(price_subtotal) FROM purchase_order_lines WHERE order_id = ?)
+                            WHERE id = ?
+                        """, (eid, eid))
+                        st.success("Line added!")
+                        st.rerun()
 
                 st.markdown("---")
                 ca,cb,cc = st.columns(3)
                 if ca.button("💾 Save",type="primary"):
-                    odoo_write("purchase.order",eid,{
-                        "partner_id": vend_map[new_vend],
-                        "notes": new_note,
-                    })
-                    st.success("✅ PO updated!"); st.cache_data.clear()
+                    db_execute("""
+                        UPDATE purchase_orders SET partner_id = ?, partner_name = ?, notes = ? WHERE id = ?
+                    """, (vend_map[new_vend], new_vend, new_note, eid))
+                    st.success("✅ PO updated!")
                 if cb.button("✅ Confirm PO"):
-                    odoo_action("purchase.order","button_confirm",eid)
-                    st.success("PO confirmed!"); st.cache_data.clear(); st.rerun()
+                    db_execute("UPDATE purchase_orders SET state = 'purchase' WHERE id = ?", (eid,))
+                    rcpt_name = f"WH/IN/{rec['name']}"
+                    pick_id = db_execute("""
+                        INSERT INTO stock_pickings (name, partner_id, partner_name, picking_type_code, picking_type_name, state, scheduled_date, origin, purchase_id)
+                        VALUES (?, ?, ?, 'incoming', 'Receipts', 'assigned', ?, ?, ?)
+                    """, (rcpt_name, vend_map[new_vend], new_vend, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), rec["name"], eid))
+                    for ln in lines:
+                        db_execute("""
+                            INSERT INTO stock_moves (picking_id, product_id, product_name, product_uom_qty, quantity, product_uom, state, date)
+                            VALUES (?, ?, ?, ?, ?, ?, 'assigned', ?)
+                        """, (pick_id, ln["product_id"], ln["product_name"], ln["product_qty"], ln["product_qty"], ln["product_uom"], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                    st.success("PO confirmed and receipt created!")
+                    st.rerun()
                 if cc.button("🗑️ Cancel PO"):
-                    odoo_action("purchase.order","button_cancel",eid)
-                    st.warning("Cancelled."); st.cache_data.clear(); st.rerun()
+                    db_execute("UPDATE purchase_orders SET state = 'cancel' WHERE id = ?", (eid,))
+                    st.warning("Cancelled.")
+                    st.rerun()
 
     # ── RECEIVE / ACCEPT PURCHASE ─────────────────────────────────────────
     elif sub == "📥 Receive / Accept":
         st.title("📥 Receive / Accept Purchases")
         st.markdown("""
         <div style="background:#e8f5e9;border-left:4px solid #4caf50;padding:12px;border-radius:6px;margin-bottom:12px">
-        Select a confirmed PO → view incoming receipt → set quantities received (with lots if tracked) → Validate to update stock.
+        Select a confirmed PO → inspect incoming line items → assign Lots/Batches → Validate to increment local warehouse inventory.
         </div>""", unsafe_allow_html=True)
 
-        with st.spinner():
-            po_confirmed = odoo_read("purchase.order",
-                [["state","=","purchase"]],
-                ["id","name","partner_id","amount_total","date_order"],
-                limit=100, order="date_order desc")
-
+        po_confirmed = db_query("SELECT id, name, partner_name FROM purchase_orders WHERE state = 'purchase' ORDER BY id DESC")
         if not po_confirmed:
-            st.info("No confirmed POs to receive. Confirm a PO first.")
+            st.info("No confirmed POs ready to receive. Confirm a PO first.")
         else:
-            po_rcv_opts = {f"{r['name']} — {flatten_m2o(r['partner_id'])}": r["id"] for r in po_confirmed}
+            po_rcv_opts = {f"{r['name']} — {r['partner_name']}": r["id"] for r in po_confirmed}
             sel_rcv = st.selectbox("Select Confirmed PO", list(po_rcv_opts.keys()))
 
             if sel_rcv:
                 po_id = po_rcv_opts[sel_rcv]
-
-                with st.spinner("Loading receipts..."):
-                    receipts = odoo_read("stock.picking",
-                        [["purchase_id","=",po_id]],
-                        ["id","name","state","scheduled_date","picking_type_id"],
-                        limit=10)
-
+                receipts = db_query("SELECT * FROM stock_pickings WHERE purchase_id = ? ORDER BY id DESC", (po_id,))
                 if not receipts:
                     st.warning("No receipt found for this PO.")
                 else:
                     for rcpt in receipts:
-                        rcpt_id    = rcpt["id"]
-                        rcpt_name  = rcpt["name"]
+                        rcpt_id = rcpt["id"]
+                        rcpt_name = rcpt["name"]
                         rcpt_state = rcpt["state"]
                         st.markdown(f"**Receipt:** {rcpt_name} — Status: {status_badge(rcpt_state)}")
 
                         if rcpt_state == "done":
-                            st.success("✅ This receipt has already been validated.")
-                            continue
-                        if rcpt_state == "cancel":
-                            st.error("❌ This receipt is cancelled.")
+                            st.success("✅ This receipt has already been validated and added to inventory.")
                             continue
 
-                        moves_in = odoo_read("stock.move",
-                            [["picking_id","=",rcpt_id]],
-                            ["id","product_id","product_uom_qty","quantity","product_uom","lot_ids","state"],
-                            limit=50)
-
+                        moves_in = db_query("SELECT * FROM stock_moves WHERE picking_id = ?", (rcpt_id,))
                         if moves_in:
                             st.markdown('<div class="section-header">📦 Lines to Receive</div>', unsafe_allow_html=True)
-
                             rcv_data = []
                             for mv in moves_in:
                                 col1,col2,col3,col4 = st.columns([3,1.5,1.5,2])
-                                prod_name = flatten_m2o(mv["product_id"])
+                                prod_name = mv["product_name"]
                                 col1.write(f"**{prod_name}**")
                                 demanded = mv["product_uom_qty"]
                                 col2.write(f"Demanded: {demanded:,.2f}")
@@ -307,31 +303,40 @@ def render_purchasing():
                                     value=float(demanded),
                                     step=0.5, key=f"rcv_qty_{mv['id']}")
 
-                                lots_avail = get_lots(mv["product_id"][0] if isinstance(mv["product_id"],list) else None)
+                                lots_avail = get_lots(mv["product_id"])
                                 lot_names = ["No Lot"] + [lt["name"] for lt in lots_avail]
-                                recv_lot = col4.selectbox("Lot",lot_names,key=f"rcv_lot_{mv['id']}")
+                                recv_lot = col4.selectbox("Lot / Batch", lot_names, key=f"rcv_lot_{mv['id']}")
                                 rcv_data.append({
                                     "move_id": mv["id"],
                                     "product_id": mv["product_id"],
+                                    "product_name": mv["product_name"],
                                     "qty": recv_qty,
                                     "lot": recv_lot,
                                 })
 
                             st.markdown("---")
-                            col_v1,col_v2 = st.columns(2)
-                            if col_v1.button("✅ Validate Receipt (Full)", type="primary", key=f"validate_{rcpt_id}"):
-                                with st.spinner("Validating..."):
-                                    for rd in rcv_data:
-                                        odoo_write("stock.move", rd["move_id"],
-                                            {"quantity": rd["qty"]})
+                            if st.button("✅ Validate Receipt & Update Stock", type="primary", key=f"validate_{rcpt_id}"):
+                                for rd in rcv_data:
+                                    # Update move quantity
+                                    db_execute("UPDATE stock_moves SET quantity = ?, state = 'done' WHERE id = ?", (rd["qty"], rd["move_id"]))
+                                    # Add to stock_quants (Main warehouse lot_stock_id=8 or first internal)
+                                    existing_quant = db_query("""
+                                        SELECT id, quantity FROM stock_quants 
+                                        WHERE product_id = ? AND location_id = 8
+                                    """, (rd["product_id"],))
+                                    if existing_quant:
+                                        db_execute("""
+                                            UPDATE stock_quants SET quantity = quantity + ? WHERE id = ?
+                                        """, (rd["qty"], existing_quant[0]["id"]))
+                                    else:
+                                        db_execute("""
+                                            INSERT INTO stock_quants (product_id, product_name, location_id, location_name, quantity, reserved_quantity)
+                                            VALUES (?, ?, 8, 'WH/KJ/Stock Dadap', ?, 0)
+                                        """, (rd["product_id"], rd["product_name"], rd["qty"]))
+                                    # Update lot qty if assigned
+                                    if rd["lot"] != "No Lot":
+                                        db_execute("UPDATE stock_lots SET product_qty = product_qty + ? WHERE name = ?", (rd["qty"], rd["lot"]))
 
-                                    res = odoo_action("stock.picking","button_validate",rcpt_id)
-                                    if res is not None:
-                                        if isinstance(res, dict) and res.get("res_model"):
-                                            st.info("Backorder dialog triggered — validating immediately.")
-                                            odoo_call("stock.picking","_action_done",[[rcpt_id]])
-                                        st.success(f"✅ Receipt {rcpt_name} validated! Stock updated.")
-                                        st.cache_data.clear(); st.rerun()
-
-                            if col_v2.button("⏩ Create Backorder", key=f"backorder_{rcpt_id}"):
-                                st.info("Partial receive: validate and a backorder will be created for remaining qty.")
+                                db_execute("UPDATE stock_pickings SET state = 'done', date_done = ? WHERE id = ?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), rcpt_id))
+                                st.success(f"✅ Receipt {rcpt_name} validated! Stock successfully updated in Kultiva Database.")
+                                st.rerun()
